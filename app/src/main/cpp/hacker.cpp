@@ -18,14 +18,14 @@ typedef void (*test_sample_t)();
 static test_sample_t test_sample = nullptr;
 
 static void hacker_jni_do_dlopen(JNIEnv* env, jobject thiz) {
-    (void)env;
-    (void)thiz;
+    (void) env;
+    (void) thiz;
 
     if (libsample_handle == nullptr) {
         libsample_handle = dlopen("libsample.so", RTLD_NOW);
         if (libsample_handle != nullptr) {
             // 动态加载，去除编译依赖
-            test_sample = (test_sample_t)dlsym(libsample_handle, "test_sample");
+            test_sample = (test_sample_t) dlsym(libsample_handle, "test_sample");
         }
     }
 }
