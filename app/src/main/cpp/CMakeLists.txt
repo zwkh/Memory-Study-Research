@@ -5,7 +5,8 @@ find_package(bytehook REQUIRED CONFIG)
 
 add_library(hacker SHARED
     hacker.cpp
-    hook_test.cpp)
+    hook_test.cpp
+    monitor.cpp)
 
 
 target_link_libraries(hacker
