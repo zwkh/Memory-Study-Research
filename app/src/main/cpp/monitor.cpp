@@ -3,7 +3,7 @@
 #include <android/log.h>
 #include <sys/mman.h>
 
-#define LOG(...) __android_log_print(ANDROID_LOG_INFO, "APM_Monitor", __VA_ARGS__)
+#define LOG(...) __android_log_print(ANDROID_LOG_INFO, "struct_monitor", __VA_ARGS__)
 
 MonitorManager& MonitorManager::GetInstance() {
     static MonitorManager instance;
@@ -38,8 +38,6 @@ void MonitorManager::UpdateMemberHot(uintptr_t addr, uint32_t offset) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = monitor_map_.find(addr);
     if (it == monitor_map_.end()) return;
-
-    LOG("manger");
     for (auto& member : it->second.struct_meta.members) {
         if (offset >= member.start_offset && offset <= member.end_offset) {
             if (!member.is_hot) {
@@ -62,7 +60,6 @@ void MonitorManager::UpdateLogicAccess(uintptr_t addr, LogicID logic_id) {
     it->second.logic_access_counts[logic_id]++;
 
     int current_count = it->second.logic_access_counts[logic_id];
-
     LOG("共享页监控：内存块 %p 被 LogicID(%d) 访问！该逻辑累计访问次数: %d",
         (void*)addr, (int)logic_id, current_count);
 }
@@ -78,7 +75,7 @@ void MonitorManager::ReprotectAllBlocks() {
 }
 
 void PendingMonitor::Pending(const StructMeta& meta){
-    // std::lock_guard lg(mux_);
+    std::lock_guard lg(mux_);
     struct_meta_.push_back(meta);
 }
 
@@ -94,7 +91,6 @@ std::vector<StructMeta> PendingMonitor::GetStructMetas() {
 extern "C" __attribute__((visibility("default")))
 void RegisterMonitorStruct(const StructMeta* meta) {
     if (meta) {
-        // 数据交给了 hacker 内部的唯一单例！
         PendingMonitor::GetInstance().Pending(*meta);
         LOG("Hook层成功接收到业务层的结构体注册: %s", meta->struct_name.c_str());
     }

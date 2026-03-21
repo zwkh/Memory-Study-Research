@@ -5,59 +5,59 @@
 #define JNI_VERSION JNI_VERSION_1_6
 #define JNI_CLASS "com/example/application/NativeHacker"
 
-static jint nativeStartHook(JNIEnv *env, jobject thiz) {
-    return start_hook();
+static jint NativeStartHook(JNIEnv *env, jobject thiz) {
+    return StartHook();
 }
 
-static jint nativeStopHook(JNIEnv *env, jobject thiz) {
-    return stop_hook();
+static jint NativeStopHook(JNIEnv *env, jobject thiz) {
+    return StopHook();
 }
 
-static void* libsample_handle = nullptr;
+static void* g_sample_handle = nullptr;
 typedef void (*test_sample_t)();
-static test_sample_t test_sample = nullptr;
+static test_sample_t g_test_sample = nullptr;
 
-static void hacker_jni_do_dlopen(JNIEnv* env, jobject thiz) {
+static void HackerDlopen(JNIEnv* env, jobject thiz) {
     (void) env;
     (void) thiz;
 
-    if (libsample_handle == nullptr) {
-        libsample_handle = dlopen("libsample.so", RTLD_NOW);
-        if (libsample_handle != nullptr) {
+    if (g_sample_handle == nullptr) {
+        g_sample_handle = dlopen("libsample.so", RTLD_NOW);
+        if (g_sample_handle != nullptr) {
             // 动态加载，去除编译依赖
-            test_sample = (test_sample_t) dlsym(libsample_handle, "test_sample");
+            g_test_sample = (test_sample_t) dlsym(g_sample_handle, "TestSample");
         }
     }
 }
 
-static void hacker_jni_do_run(JNIEnv* env, jobject thiz) {
+static void HackerRun(JNIEnv* env, jobject thiz) {
     (void)env;
     (void)thiz;
 
-    if (test_sample != nullptr) {
-        test_sample();
+    if (g_test_sample != nullptr) {
+        g_test_sample();
     }
 }
 
-static void hacker_jni_do_dlclose(JNIEnv* env, jobject thiz) {
+static void HackerDlclose(JNIEnv* env, jobject thiz) {
     (void)env;
     (void)thiz;
 
-    if (libsample_handle != nullptr) {
-       test_sample = nullptr;
-        dlclose(libsample_handle);
-        libsample_handle = nullptr;
+    if (g_sample_handle != nullptr) {
+       g_test_sample = nullptr;
+        dlclose(g_sample_handle);
+        g_sample_handle = nullptr;
     }
 }
 
 
 // JNI 方法注册
 static JNINativeMethod g_methods[] = {
-        {"startHook", "()I", (void*)nativeStartHook},
-        {"stopHook", "()I", (void*)nativeStopHook},
-        {"nativeDoDlopen",     "()V",  (void*)hacker_jni_do_dlopen},        // 加载sample
-        {"nativeDoRun",        "()V",  (void*)hacker_jni_do_run},           // 运行测试
-        {"nativeDoDlclose",    "()V",  (void*)hacker_jni_do_dlclose}        // 卸载sample
+        {"startHook", "()I", (void*)NativeStartHook},
+        {"stopHook", "()I", (void*)NativeStopHook},
+        {"nativeDoDlopen",     "()V",  (void*)HackerDlopen},        // 加载sample
+        {"nativeDoRun",        "()V",  (void*)HackerRun},           // 运行测试
+        {"nativeDoDlclose",    "()V",  (void*)HackerDlclose}        // 卸载sample
 };
 
 // JNI 入口
