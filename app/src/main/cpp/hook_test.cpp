@@ -13,6 +13,7 @@
 
 #include "bytehook.h"
 #include "monitor.h"
+#include "elf_reader.h"
 
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "APM_Hook", __VA_ARGS__)
 
@@ -359,6 +360,8 @@ extern "C" int start_hook() {
     sa.sa_flags = SA_SIGINFO | SA_NODEFER;
     sigaction(SIGSEGV, &sa, &old_sa);
     start_monitor_thread();
+
+    ElfReader::Analyze("libsample.so");
 
     bytehook_init(BYTEHOOK_MODE_MANUAL, true);
 
