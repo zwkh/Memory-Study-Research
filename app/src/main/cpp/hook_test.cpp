@@ -56,9 +56,6 @@ static struct sigaction old_sa;
 #define LOG_FILE_PATH "/storage/emulated/0/Android/data/com.example.application/files/mem_reg.log"
 #define LOG_BUF_SIZE 4096
 
-// 【极其关键】：线程局部防重入锁，保护 Hook 函数不发生死循环和误拦截！
-static __thread bool g_in_hook = false;
-
 static uint64_t get_current_time_ms() {
     timeval tv{};
     gettimeofday(&tv, nullptr);
@@ -133,8 +130,10 @@ LogicID IdentifyLogicFromStack(uintptr_t* frames, size_t count) {
     for (size_t i = 0; i < count; ++i) {
         Dl_info info;
         if (dladdr((void*)frames[i], &info) && info.dli_sname) {
-            if (strstr(info.dli_sname, "logic_A_process")) return LogicID::LOGIC_A;
-            if (strstr(info.dli_sname, "logic_B_process")) return LogicID::LOGIC_B;
+            if (strstr(info.dli_sname, "logic_1_process")) return LogicID::LOGIC_1;
+            if (strstr(info.dli_sname, "logic_2_process")) return LogicID::LOGIC_2;
+            if (strstr(info.dli_sname, "logic_3_process")) return LogicID::LOGIC_3;
+            if (strstr(info.dli_sname, "logic_4_process")) return LogicID::LOGIC_4;
         }
     }
     return LogicID::LOGIC_UNKNOWN;
@@ -142,29 +141,26 @@ LogicID IdentifyLogicFromStack(uintptr_t* frames, size_t count) {
 
 // SIGSEGV 信号拦截器
 static void sigsegv_handler(int sig, siginfo_t *info, void *ucontext) {
-    // 【防重入保护】如果在处理信号时又崩溃了，或者我们主动挂了金牌，直接交回给系统兜底
-    if (g_in_hook) {
-        if (old_sa.sa_flags & SA_SIGINFO) old_sa.sa_sigaction(sig, info, ucontext);
-        else if (old_sa.sa_handler != SIG_DFL && old_sa.sa_handler != SIG_IGN) old_sa.sa_handler(sig);
-        return;
-    }
-
-    g_in_hook = true; // 挂上免死金牌，准备施展神仙操作
-
     uintptr_t fault_addr = (uintptr_t)info->si_addr;
-    uintptr_t page_base = fault_addr & ~(G_PAGE_SIZE - 1);
+    uintptr_t page_base = fault_addr & ~(G_PAGE_SIZE - 1); // 找到所属的内存页起址
 
+    LOG("fwiqwhfiwnifncwoenc----------------------");
     MonitorBlock block;
+    // 多线程安全点：GetMonitorBlock 内部已加锁，且做的是值拷贝！
+    LOG("ndiansdias %d", MonitorManager::GetInstance().GetMonitorBlock(page_base, block));
     if (MonitorManager::GetInstance().GetMonitorBlock(page_base, block)) {
 
         uint32_t offset = fault_addr - page_base;
 
-        if (block.monitor_type == MonitorType::MEMBER) {
-            // 需求 2：结构体成员精细拆解冷热
+        // 策略 A：如果开启了成员监控，则计算偏移量
+        if (block.monitor_type & MonitorType::MEMBER) {
+            LOG("mo--------");
             MonitorManager::GetInstance().UpdateMemberHot(page_base, offset);
         }
-        else if (block.monitor_type == MonitorType::SHARE) {
-            // 需求 3：共享内存多逻辑访问溯源
+
+        // 策略 B：如果开启了共享监控，则抓栈溯源
+        if (block.monitor_type & MonitorType::SHARE) {
+            LOG("mo1--------------");
             uintptr_t frames[15];
             BacktraceState state = {frames, frames + 15};
             _Unwind_Backtrace(unwind_cb, &state);
@@ -174,169 +170,162 @@ static void sigsegv_handler(int sig, siginfo_t *info, void *ucontext) {
             MonitorManager::GetInstance().UpdateLogicAccess(page_base, logic);
         }
 
-        // 放行权限，让触发异常的那行汇编代码能继续跑下去
+        // 放开权限，让触发崩溃的业务代码能够继续执行
         mprotect((void*)page_base, block.size, PROT_READ | PROT_WRITE);
-
-        g_in_hook = false; // 摘下免死金牌
         return;
     }
 
-    g_in_hook = false; // 没命中监控，摘下免死金牌
-
-    // 不是我们监控的页，把锅甩给系统原生的崩溃处理器
+    // 非隔离页，交给系统兜底处理
     if (old_sa.sa_flags & SA_SIGINFO) old_sa.sa_sigaction(sig, info, ucontext);
     else if (old_sa.sa_handler != SIG_DFL && old_sa.sa_handler != SIG_IGN) old_sa.sa_handler(sig);
 }
 
 // malloc 接管与内存隔离
 void* my_malloc(size_t size) {
-    // 【防重入保护】如果已经在 hook 流程里，说明是监控工具内部申请的内存，绝对不能拦截！
-    if (g_in_hook || !g_orig_malloc) {
-        return g_orig_malloc ? g_orig_malloc(size) : nullptr;
-    }
-
-    g_in_hook = true; // 进入沙盒模式
     void* result = nullptr;
+    bool hook = false;
+    auto metas = PendingMonitor::GetInstance().GetStructMetas();
+    LOG("hhhhhhhhhh %d", metas.size());
 
-    // --- 【需求 1 & 2】：识别小对象并强行放入独立页 ---
-    if (size == 1024 /* 或者 size < 4096 */) {
-        size_t alloc_size = G_PAGE_SIZE;
-        void* page_ptr = mmap(nullptr, alloc_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    bool need_hook = false;
+    if (!metas.empty()) {
 
-        if (page_ptr != MAP_FAILED) {
-            MonitorBlock block{};
-            block.address = (uintptr_t)page_ptr;
-            block.size = alloc_size;
-            block.monitor_type = MonitorType::MEMBER;
-            block.is_monitored = true;
-            block.struct_meta = { "TestStruct", 1024, {
-                    {"name", 0, 15, false}, {"id", 16, 19, false}, {"data", 20, 1023, false}
-            }};
+        for (auto& meta : metas) {
+            if (size != meta.struct_size) continue;
+            need_hook = true;
+            // 不管业务申请 24 还是 1024 字节，统一向上取整到一页(4KB)来进行高压电隔离
+            size_t alloc_size = (size + G_PAGE_SIZE - 1) & ~(G_PAGE_SIZE - 1);
+            void* page_ptr = mmap(nullptr, alloc_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
-            MonitorManager::GetInstance().AddMonitorBlock(block);
-            mprotect(page_ptr, alloc_size, PROT_NONE); // 上高压电！
+            if (page_ptr != MAP_FAILED) {
+                MonitorBlock block{};
+                block.address = (uintptr_t)page_ptr;
+                block.size = alloc_size;
+                block.req_size = size;       // 记录真实大小防越界
+                block.is_monitored = true;   // 让后台线程来巡逻
+                block.monitor_type = MonitorType::BOTH;
+                block.struct_meta = meta;
 
-            result = page_ptr; // 狸猫换太子，返回隔离页的地址
-            LOG("成功接管 TestStruct，分配至隔离页: %p", result);
+                MonitorManager::GetInstance().AddMonitorBlock(block);
+                mprotect(page_ptr, alloc_size, PROT_NONE); // 上锁
+
+                result = page_ptr;
+                LOG("成功接管自定义对象，真实大小: %zu，分配至隔离页: %p", size, result);
+
+                char backtrace[1024]; get_backtrace(backtrace, sizeof(backtrace));
+                write_memory_log(TYPE_MALLOC, result, size, backtrace);
+            }
         }
-    }
-        // --- 【需求 3】：识别出共享大页 ---
-    else if (size == 4096) {
-        void* page_ptr = mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
-        if (page_ptr != MAP_FAILED) {
-            MonitorBlock block{};
-            block.address = (uintptr_t)page_ptr;
-            block.size = 4096;
-            block.monitor_type = MonitorType::SHARE;
-            block.is_monitored = true;
-
-            MonitorManager::GetInstance().AddMonitorBlock(block);
-            mprotect(page_ptr, 4096, PROT_NONE);
-
-            result = page_ptr;
-            LOG("成功接管 共享大页，分配至隔离页: %p", result);
-        }
     }
 
-    // --- 原生兜底逻辑 ---
-    if (result == nullptr) {
-        uint64_t ts = get_current_time_ms();
+    // 如果当前线程没挂号（绝大多数情况），或者 mmap 失败，老老实实走系统原生分配
+    if (!need_hook) {
         result = g_orig_malloc(size);
 
-        char backtrace[1024];
-        get_backtrace(backtrace, sizeof(backtrace));
+        // （可选）记录原生分配日志
+        // char backtrace[1024]; get_backtrace(backtrace, sizeof(backtrace));
         // write_memory_log(TYPE_MALLOC, result, size, backtrace);
-        // LOG("%" PRIu64 ",%d,%p,%zu,%s", ts, TYPE_MALLOC, result, size, backtrace);
     }
 
-    g_in_hook = false; // 退出沙盒模式
     return result;
 }
 
 void my_free(void* ptr) {
     if (!ptr) return;
 
-    if (g_in_hook || !g_orig_free) {
-        if (g_orig_free) g_orig_free(ptr);
-        return;
-    }
-
-    g_in_hook = true; // 进入沙盒模式
-
     MonitorBlock block;
-    // 【关键】：检查是不是我们 mmap 出来的隔离页？
+    // 检查：这块内存是不是我们刚才偷偷用 mmap 搞出来的？
     if (MonitorManager::GetInstance().GetMonitorBlock((uintptr_t)ptr, block)) {
         MonitorManager::GetInstance().RemoveMonitorBlock((uintptr_t)ptr);
-        // 放开权限再 munmap，防止析构函数或操作系统回收时崩溃
+
+        // 关键步骤：先解开 mprotect 的锁，否则 munmap 时操作系统可能会内核崩溃！
         mprotect(ptr, block.size, PROT_READ | PROT_WRITE);
         munmap(ptr, block.size);
-        LOG("释放受控隔离页: %p", ptr);
+        write_memory_log(TYPE_FREE, ptr, 0, nullptr);
+        LOG("释放自定义受控隔离页: %p", ptr);
     } else {
-        // 普通的 malloc 内存，交给原生的 free 释放
-        uint64_t ts = get_current_time_ms();
+        // 原生的内存，乖乖交还给系统的 Scudo 分配器
         g_orig_free(ptr);
-        // write_memory_log(TYPE_FREE, ptr, 0, nullptr);
+        write_memory_log(TYPE_FREE, ptr, 0, nullptr);
     }
-
-    g_in_hook = false; // 退出沙盒模式
 }
 
 // ==========================================
 // 其他内存函数的 Hook (保持原有逻辑，但加上沙盒保护)
 // ==========================================
 void* my_realloc(void* ptr, size_t size) {
-    if (g_in_hook || !g_orig_realloc) return g_orig_realloc ? g_orig_realloc(ptr, size) : nullptr;
-    g_in_hook = true;
+    if (!ptr) return my_malloc(size); // realloc(NULL, size) 等价于 malloc
+    if (size == 0) { my_free(ptr); return nullptr; } // realloc(ptr, 0) 等价于 free
 
-    uint64_t ts = get_current_time_ms();
+    MonitorBlock old_block;
+    // 检查：业务试图扩容的这块旧内存，是不是我们的隔离页？
+    if (MonitorManager::GetInstance().GetMonitorBlock((uintptr_t)ptr, old_block)) {
+
+        // 1. 解开旧页的锁，因为稍后我们要读它里面的数据
+        mprotect(ptr, old_block.size, PROT_READ | PROT_WRITE);
+
+        // 2. 为业务申请新内存（可能也是隔离的，也可能是原生的，my_malloc 自己会判断）
+        void* new_ptr = my_malloc(size);
+
+        char backtrace[1024]; get_backtrace(backtrace, sizeof(backtrace));
+        write_memory_log(TYPE_REALLOC, new_ptr, size, backtrace);
+        if (new_ptr) {
+            // 3. 搬运数据
+            // 注意：如果新内存也被隔离了，它现在处于 PROT_NONE，我们必须临时解开新锁才能写入！
+            MonitorBlock new_block;
+            bool is_new_monitored = MonitorManager::GetInstance().GetMonitorBlock((uintptr_t)new_ptr, new_block);
+            if (is_new_monitored) {
+                mprotect(new_ptr, new_block.size, PROT_READ | PROT_WRITE);
+            }
+
+            // 防越界拷贝：只拷贝旧页中真实属于业务的数据大小
+            size_t copy_size = (old_block.req_size < size) ? old_block.req_size : size;
+            memcpy(new_ptr, ptr, copy_size);
+
+            // 重新挂上新页的锁
+            if (is_new_monitored) {
+                mprotect(new_ptr, new_block.size, PROT_NONE);
+            }
+        }
+
+        // 4. 彻底销毁旧的隔离页
+        MonitorManager::GetInstance().RemoveMonitorBlock((uintptr_t)ptr);
+        munmap(ptr, old_block.size);
+
+        return new_ptr;
+    }
+
+    // 如果旧内存不是隔离页，正常交给系统扩容
     void* address = g_orig_realloc(ptr, size);
-    char backtrace[1024];
-    get_backtrace(backtrace, sizeof(backtrace));
-    // write_memory_log(TYPE_REALLOC, address, size, backtrace);
-
-    g_in_hook = false;
+    char backtrace[1024]; get_backtrace(backtrace, sizeof(backtrace));
+    write_memory_log(TYPE_REALLOC, address, size, backtrace);
     return address;
 }
 
 void* my_calloc(size_t size, size_t per_size) {
-    if (g_in_hook || !g_orig_calloc) return g_orig_calloc ? g_orig_calloc(size, per_size) : nullptr;
-    g_in_hook = true;
-
     uint64_t ts = get_current_time_ms();
-    void* address = g_orig_calloc(size, per_size);
+    void *address = g_orig_calloc(size, per_size);
     char backtrace[1024];
     get_backtrace(backtrace, sizeof(backtrace));
     size_t total = size * per_size;
-    // write_memory_log(TYPE_CALLOC, address, total, backtrace);
-
-    g_in_hook = false;
+    write_memory_log(TYPE_CALLOC, address, total, backtrace);
     return address;
 }
 
 void* my_mmap(void* address, size_t length, int prot, int flags, int fd, off_t offset) {
-    if (g_in_hook || !g_orig_mmap) return g_orig_mmap ? g_orig_mmap(address, length, prot, flags, fd, offset) : nullptr;
-    g_in_hook = true;
-
     uint64_t ts = get_current_time_ms();
     void* address_res = g_orig_mmap(address, length, prot, flags, fd, offset);
     char backtrace[1024];
     get_backtrace(backtrace, sizeof(backtrace));
-    // write_memory_log(TYPE_MMAP, address_res, length, backtrace);
-
-    g_in_hook = false;
+    write_memory_log(TYPE_MMAP, address_res, length, backtrace);
     return address_res;
 }
 
 int my_munmap(void* address, size_t length) {
-    if (g_in_hook || !g_orig_munmap) return g_orig_munmap ? g_orig_munmap(address, length) : -1;
-    g_in_hook = true;
-
     uint64_t ts = get_current_time_ms();
     int res = g_orig_munmap(address, length);
-    // write_memory_log(TYPE_MUNMAP, address, 0, nullptr);
-
-    g_in_hook = false;
+    write_memory_log(TYPE_MUNMAP, address, 0, nullptr);
     return res;
 }
 

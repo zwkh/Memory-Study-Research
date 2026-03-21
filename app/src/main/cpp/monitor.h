@@ -7,15 +7,26 @@
 #include <mutex>
 
 enum class LogicID : int {
-    LOGIC_UNKNOWN = -1,
-    LOGIC_A = 0,
-    LOGIC_B = 1
+    LOGIC_UNKNOWN = 0,
+    LOGIC_1 = 1,
+    LOGIC_2 = 2,
+    LOGIC_3 = 3,
+    LOGIC_4 = 4
 };
 
 enum class MonitorType : int {
-    MEMBER = 0,
-    SHARE = 1
+    NONE   = 0,
+    MEMBER = 1 << 0,
+    SHARE  = 1 << 1,
+    BOTH   = MEMBER | SHARE
 };
+
+inline MonitorType operator|(MonitorType a, MonitorType b) {
+    return static_cast<MonitorType>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+}
+inline bool operator&(MonitorType a, MonitorType b) {
+    return (static_cast<uint32_t>(a) & static_cast<uint32_t>(b)) != 0;
+}
 
 struct Member {
     std::string member_name;
@@ -33,10 +44,22 @@ struct StructMeta {
 struct MonitorBlock {
     uintptr_t address;
     size_t size;
+    size_t req_size;
     MonitorType monitor_type;
     StructMeta struct_meta;
     std::unordered_map<LogicID, int> logic_access_counts;
     bool is_monitored;
+};
+
+class PendingMonitor {
+public:
+    static PendingMonitor& GetInstance();
+    void Pending(const StructMeta& meta);
+    std::vector<StructMeta> GetStructMetas();
+private:
+    PendingMonitor() = default;
+    std::mutex mux_;
+    std::vector<StructMeta> struct_meta_;
 };
 
 class MonitorManager {

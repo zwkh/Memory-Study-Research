@@ -5,6 +5,8 @@
 #include <sys/mman.h>
 #include <thread>
 #include <unistd.h>
+#include <dlfcn.h>
+#include "monitor.h"
 
 #define TAG "bytehook_sample"
 
@@ -18,7 +20,7 @@ struct TestStruct {
 
 //extern "C" void test_malloc() {
 //    __android_log_print(ANDROID_LOG_INFO, TAG, "test malloc");
-//    // size_t size = 1024;
+//    size_t size = 1024;
 //    TestStruct* address = (TestStruct*) malloc(sizeof(TestStruct));
 //    __android_log_print(ANDROID_LOG_INFO, TAG, "test malloc：%p", address);
 //    address->id = 100;
@@ -27,58 +29,79 @@ struct TestStruct {
 //}
 
 // ==========================================
-// 模拟业务逻辑函数
+// 4 个不同逻辑的线程
 // ==========================================
-extern "C" void logic_A_process(void* shared_mem) {
-    __android_log_print(ANDROID_LOG_INFO, TAG, "逻辑A开始执行 (预期不访问共享内存)");
-    // 逻辑 A 假装自己很忙，但就是不碰 shared_mem
-    usleep(500000);
+extern "C" void logic_1_process(void* mem) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    __android_log_print(ANDROID_LOG_INFO, TAG, "逻辑 1 执行：访问 name");
+    ((TestStruct*)mem)->name[0] = 'A';
 }
 
-extern "C" void logic_B_process(void* shared_mem) {
-    __android_log_print(ANDROID_LOG_INFO, TAG, "逻辑B开始执行 (预期访问共享内存)");
-    // 逻辑 B 访问了共享内存！
-    int* ptr = (int*)shared_mem;
-    int val = ptr[0]; // 触发读操作
-    usleep(500000);
+extern "C" void logic_2_process(void* mem) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    __android_log_print(ANDROID_LOG_INFO, TAG, "逻辑 2 执行：访问 id");
+    ((TestStruct*)mem)->id = 100;
+}
+
+extern "C" void logic_3_process(void* mem) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    __android_log_print(ANDROID_LOG_INFO, TAG, "逻辑 3 执行：访问 data");
+    ((TestStruct*)mem)->data[0] = 'X';
+}
+
+extern "C" void logic_4_process(void* mem) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(800));
+    __android_log_print(ANDROID_LOG_INFO, TAG, "逻辑 4 执行：我只打酱油，绝不碰共享内存！");
+    // 什么都不做
 }
 
 // ==========================================
-// 触发所有测试的入口函数
+// 触发总入口
 // ==========================================
 extern "C" void test_all_features() {
-    // ---------------------------------------------------
-    // 场景一：结构体成员精细化监控 (需求 1 & 2)
-    // ---------------------------------------------------
-    __android_log_print(ANDROID_LOG_INFO, TAG, "--- 开始测试结构体成员监控 ---");
-    // 这里调用 malloc，实际上会跑到我们的 my_malloc 里去
-    TestStruct* address = (TestStruct*) malloc(sizeof(TestStruct));
+    __android_log_print(ANDROID_LOG_INFO, TAG, "--- 开始终极双开监控测试 (MEMBER + SHARE) ---");
 
-    // 业务代码给 id 赋值。注意：id 的偏移量是 16。
-    // 这行代码在 CPU 执行时，会因为没有权限直接触发 SIGSEGV！
-    address->id = 100;
+    StructMeta test_meta = {
+            "TestStruct", sizeof(TestStruct), {
+                    {"name", 0, 15, false},
+                    {"id", 16, 19, false},
+                    {"data", 20, 1023, false}
+            }
+    };
 
-    sleep(1);
-    // 业务代码给 data 赋值。偏移量是 20。
-    address->data[0] = 'X';
+    // 【一键双开】：同时开启 MEMBER 和 SHARE 监控！
+    // APM_API::MarkNextAlloc(MonitorType::BOTH, LogicID::LOGIC_UNKNOWN, test_meta);
+    void* handle = dlopen("libhacker.so", RTLD_NOW);
+    if (handle) {
+        // 定义函数指针类型
+        typedef void (*RegisterFunc)(const StructMeta*);
+        // 找到我们刚才导出的那个大门函数
+        RegisterFunc reg_func = (RegisterFunc)dlsym(handle, "RegisterMonitorStruct");
 
-    free(address);
+        if (reg_func) {
+            // 把数据传过去！
+            reg_func(&test_meta);
+        } else {
+            __android_log_print(ANDROID_LOG_ERROR, TAG, "找不到 RegisterMonitorStruct 符号");
+        }
+        dlclose(handle);
+    }
+    // 分配内存
+    TestStruct* shared_obj = (TestStruct*) malloc(sizeof(TestStruct));
 
-    // ---------------------------------------------------
-    // 场景二：多逻辑共享内存监控 (需求 3)
-    // ---------------------------------------------------
-    __android_log_print(ANDROID_LOG_INFO, TAG, "--- 开始测试共享页逻辑归属 ---");
-    // 假设申请一页 4096 字节当共享内存
-    void* shared_page = malloc(4096);
-
-    // 丢给两个线程去跑
-    std::thread t1(logic_A_process, shared_page);
-    std::thread t2(logic_B_process, shared_page);
+    // 启动 4 个线程，把这个对象扔给它们共享
+    std::thread t1(logic_1_process, shared_obj);
+    std::thread t2(logic_2_process, shared_obj);
+    std::thread t3(logic_3_process, shared_obj);
+    std::thread t4(logic_4_process, shared_obj);
 
     t1.join();
     t2.join();
+    t3.join();
+    t4.join();
 
-    free(shared_page);
+    free(shared_obj);
+    __android_log_print(ANDROID_LOG_INFO, TAG, "--- 测试结束 ---");
 }
 
 extern "C" void test_calloc() {
@@ -101,7 +124,7 @@ extern "C" void test_realloc() {
 
 extern "C" void test_mmap() {
     __android_log_print(ANDROID_LOG_INFO, TAG, "test mmap");
-    size_t size = 1024;
+    size_t size = 512;
     void* address = mmap(nullptr, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
     if (address != MAP_FAILED) {
         __android_log_print(ANDROID_LOG_INFO, TAG, "test mmap address: %p", address);

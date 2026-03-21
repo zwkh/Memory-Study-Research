@@ -1,7 +1,7 @@
 #include "monitor.h"
 #include <mutex>
 #include <android/log.h>
-#include <sys/mman.h> // 需要用到 mprotect
+#include <sys/mman.h>
 
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "APM_Monitor", __VA_ARGS__)
 
@@ -39,6 +39,7 @@ void MonitorManager::UpdateMemberHot(uintptr_t addr, uint32_t offset) {
     auto it = monitor_map_.find(addr);
     if (it == monitor_map_.end()) return;
 
+    LOG("manger");
     for (auto& member : it->second.struct_meta.members) {
         if (offset >= member.start_offset && offset <= member.end_offset) {
             if (!member.is_hot) {
@@ -73,5 +74,28 @@ void MonitorManager::ReprotectAllBlocks() {
         if (pair.second.is_monitored) {
             mprotect((void*)pair.second.address, pair.second.size, PROT_NONE);
         }
+    }
+}
+
+void PendingMonitor::Pending(const StructMeta& meta){
+    // std::lock_guard lg(mux_);
+    struct_meta_.push_back(meta);
+}
+
+PendingMonitor &PendingMonitor::GetInstance() {
+    static PendingMonitor monitor;
+    return monitor;
+}
+
+std::vector<StructMeta> PendingMonitor::GetStructMetas() {
+    return struct_meta_;
+}
+
+extern "C" __attribute__((visibility("default")))
+void RegisterMonitorStruct(const StructMeta* meta) {
+    if (meta) {
+        // 数据交给了 hacker 内部的唯一单例！
+        PendingMonitor::GetInstance().Pending(*meta);
+        LOG("Hook层成功接收到业务层的结构体注册: %s", meta->struct_name.c_str());
     }
 }
