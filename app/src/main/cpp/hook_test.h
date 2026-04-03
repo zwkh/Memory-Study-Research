@@ -5,8 +5,8 @@
 extern "C" {
 #endif
 
-int start_hook();
-int stop_hook();
+int StartHook();
+int StopHook();
 
 #ifdef __cplusplus
 }

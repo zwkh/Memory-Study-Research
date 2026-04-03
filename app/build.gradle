@@ -24,7 +24,7 @@ android {
             }
         }
         ndk {
-            abiFilters 'armeabi-v7a', 'arm64-v8a'
+            abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86_64'
         }
     }
 
@@ -48,6 +48,11 @@ android {
         viewBinding true
         prefab true
     }
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
 }
 
 dependencies {
@@ -57,5 +62,5 @@ dependencies {
     testImplementation libs.junit
     androidTestImplementation libs.ext.junit
     androidTestImplementation libs.espresso.core
-    implementation 'com.bytedance:bytehook:1.1.1'
+    implementation 'com.bytedance:bytehook:1.0.10'
 }
