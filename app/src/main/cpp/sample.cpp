@@ -66,7 +66,7 @@ extern "C" void TestStructVisit() {
     void* handle = dlopen("libhacker.so", RTLD_NOW);
     if (handle) {
         typedef void (*RegisterFunc)(const StructMeta*);
-        RegisterFunc reg_func = (RegisterFunc) dlsym(handle, "RegisterMonitorStruct");
+        auto reg_func = reinterpret_cast<RegisterFunc>(dlsym(handle, "RegisterMonitorStruct"));
         if (reg_func) {
             reg_func(&test_meta);
         } else {
@@ -74,21 +74,26 @@ extern "C" void TestStructVisit() {
         }
         dlclose(handle);
     }
-    TestStruct* shared_obj = (TestStruct*) malloc(sizeof(TestStruct));
-    for (int i=0;i<4;++i){
-        TestStruct* shared_obj = (TestStruct*) malloc(sizeof(TestStruct));
+    auto* test_demo = static_cast<TestStruct*>(malloc(sizeof(TestStruct)));
+    std::array<TestStruct*, 4> test{};
+    for (int i=0; i<4; ++i){
+        auto* test_demo_t = static_cast<TestStruct*>(malloc(sizeof(TestStruct)));
+        test[i] = test_demo_t;
     }
     // 启动 4 个线程，访问结构成员
-    std::thread t1(Logic1, shared_obj);
-    std::thread t2(Logic2, shared_obj);
-    std::thread t3(Logic3, shared_obj);
-    std::thread t4(Logic4, shared_obj);
+    std::thread t1(Logic1, test_demo);
+    std::thread t2(Logic2, test_demo);
+    std::thread t3(Logic3, test_demo);
+    std::thread t4(Logic4, test_demo);
 
     t1.join();
     t2.join();
     t3.join();
     t4.join();
-    free(shared_obj);
+    free(test_demo);
+    for (auto & i : test){
+        free(reinterpret_cast<void*>(i));
+    }
 }
 
 extern "C" void TestCalloc() {

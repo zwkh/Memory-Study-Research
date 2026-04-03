@@ -19,52 +19,51 @@
 
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "hook_test", __VA_ARGS__)
 
-#define TYPE_MALLOC 1
-#define TYPE_REALLOC 2
-#define TYPE_CALLOC 3
-#define TYPE_FREE 4
-#define TYPE_MMAP 5
-#define TYPE_MUNMAP 6
+enum class AllocType : int {
+    MALLOC = 1,
+    REALLOC = 2,
+    CALLOC = 3,
+    FREE = 4,
+    MMAP = 5,
+    MUNMAP = 6
+};
+
+constexpr size_t MAX_HOOK_COUNT = 10;
+constexpr size_t MAX_BACKTRACE_DEPTH = 20;
+constexpr size_t LOG_BUF_SIZE = 4096;
+constexpr std::string_view LOG_FILE_PATH = "/storage/emulated/0/Android/data/com.example.application/files/mem_reg.log";
+constexpr std::string_view LOG_FILE_PATH_VIS = "/storage/emulated/0/Android/data/com.example.application/files/mem_visit.log";
+constexpr std::string_view KERNEL_IDLE_BITMAP = "/sys/kernel/mm/page_idle/bitmap";
+constexpr std::string_view PAGEMAP_PATH = "/proc/self/pagemap";
 
 // 原函数指针
-typedef void* (*orig_malloc_t)(size_t);
-static orig_malloc_t g_orig_malloc = nullptr;
+using OrigMalloc  = void* (*)(size_t);
+using OrigRealloc = void* (*)(void*, size_t);
+using OrigCalloc  = void* (*)(size_t, size_t);
+using OrigFree    = void  (*)(void*);
+using OrigMmap    = void* (*)(void*, size_t, int, int, int, off_t);
+using OrigMunmap  = int   (*)(void*, size_t);
 
-typedef void* (*orig_realloc_t)(void*, size_t);
-static orig_realloc_t g_orig_realloc = nullptr;
+struct OrigFunction {
+    OrigMalloc  malloc{nullptr};
+    OrigRealloc realloc{nullptr};
+    OrigCalloc  calloc{nullptr};
+    OrigFree    free{nullptr};
+    OrigMmap    mmap{nullptr};
+    OrigMunmap  munmap{nullptr};
+};
+static OrigFunction g_orig;
 
-typedef void* (*orig_calloc_t)(size_t, size_t);
-static orig_calloc_t g_orig_calloc = nullptr;
+static std::array<bytehook_stub_t, MAX_HOOK_COUNT> g_hook_stubs{};
+static std::atomic<int> g_hook_count{0};
+static std::atomic<bool> g_kernel_monitor{false};
 
-typedef void (*orig_free_t)(void*);
-static orig_free_t g_orig_free = nullptr;
-
-typedef void* (*orig_mmap_t)(void*, size_t, int, int, int, off_t);
-static orig_mmap_t g_orig_mmap = nullptr;
-
-typedef int (*orig_munmap_t)(void*, size_t);
-static orig_munmap_t g_orig_munmap = nullptr;
-
-#define MAX_HOOK_COUNT 10
-static bytehook_stub_t g_hook_stubs[MAX_HOOK_COUNT];
-static int g_hook_count = 0;
-
-#define MAX_BACKTRACE_DEPTH 20
-static size_t g_page_size = sysconf(_SC_PAGESIZE);
-static struct sigaction old_sa;
-
-// log保存路径
-#define LOG_FILE_PATH "/storage/emulated/0/Android/data/com.example.application/files/mem_reg.log"
-#define LOG_FILE_PATH_VIS "/storage/emulated/0/Android/data/com.example.application/files/mem_visit.log"
-#define LOG_BUF_SIZE 4096
-#define KERNEL_IDLE_BITMAP "/sys/kernel/mm/page_idle/bitmap"
-#define PAGEMAP_PATH "/proc/self/pagemap"
-
-static bool g_kernel_monitor_running = false;
+static const size_t g_page_size = sysconf(_SC_PAGESIZE);
+static struct sigaction g_old_sa;
 
 // 虚拟地址 -> 物理页帧号
 static uint64_t GetPFN(uintptr_t va) {
-    int fd = open(PAGEMAP_PATH, O_RDONLY);
+    int fd = open(PAGEMAP_PATH.data(), O_RDONLY);
     if (fd < 0) return 0;
     uint64_t entry;
     // 每个 entry 8 字节
@@ -72,19 +71,21 @@ static uint64_t GetPFN(uintptr_t va) {
         close(fd); return 0;
     }
     close(fd);
+    // 物理页未加载到内存
     if (!(entry & (1ULL << 63))) return 0;
+    // 找到PFN
     return entry & ((1ULL << 55) - 1);
 }
 
 static bool IsPageIdle(uint64_t pfn) {
-    int fd = open(KERNEL_IDLE_BITMAP, O_RDWR);
+    int fd = open(KERNEL_IDLE_BITMAP.data(), O_RDWR);
     if (fd < 0) return false;
     uint64_t byte_offset = (pfn / 64) * 8;
     int bit_pos = pfn % 64;
     uint64_t bitmap_val;
     pread(fd, &bitmap_val, 8, byte_offset);
+    // 判断该页访问没有
     bool idle = (bitmap_val >> bit_pos) & 1ULL;
-
     // 重置
     uint64_t set_val = 1ULL << bit_pos;
     pwrite(fd, &set_val, 8, byte_offset);
@@ -93,32 +94,26 @@ static bool IsPageIdle(uint64_t pfn) {
 }
 
 static uint64_t GetTimeStamp() {
-    timeval tv{};
-    gettimeofday(&tv, nullptr);
-    return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
 static void StartIdleMonitor() {
-    if (g_kernel_monitor_running) return;
-    g_kernel_monitor_running = true;
+    bool expected = false;
+    // 保证线程只启动一次
+    if (!g_kernel_monitor.compare_exchange_strong(expected, true)) return;
 
     std::thread([]() {
         LOG("内核 Idle 独立监控线程已启动");
-        LOG("jjjjjjj %d", g_kernel_monitor_running);
-        while (g_kernel_monitor_running) {
-            // 每 2 秒进行一次物理内存采样
-            // std::this_thread::sleep_for(std::chrono::seconds(2));
+        while (g_kernel_monitor) {
+            // 500毫秒监控一次
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
             std::vector<MonitorBlock> all_blocks = MonitorManager::GetInstance().GetAllBlocks();
             if (all_blocks.empty()) continue;
-
-            LOG("kkkkkkkk %d", all_blocks.size());
             uint64_t ts = GetTimeStamp();
-            // 以 a+ 模式打开，输出到同一个文件
-            FILE* fp = fopen(LOG_FILE_PATH_VIS, "a+");
-            LOG("hhhhhhhhhh %p", fp);
+            FILE* fp = fopen(LOG_FILE_PATH_VIS.data(), "a+");
             if (fp) {
-                LOG("成功打开文件");
                 for (auto& block : all_blocks) {
                     int idle_count = 0;
                     int total_pages = block.size / g_page_size;
@@ -130,28 +125,26 @@ static void StartIdleMonitor() {
                             idle_count++;
                         }
                     }
-
-                    // 日志输出格式：时间戳, 类型99, 地址, 总页数, 空闲页数
-                    // 这里的空闲页数越多，说明这块分配出的内存越“冷”
-                    fprintf(fp, "%" PRIu64 ",%p, total_page: %d, free_page: %d\n", ts, (void*)block.address, total_pages, idle_count);
+                    // 输出mem_visit.log
+                    fprintf(fp, "%" PRIu64 ",%p, total_page: %d, hot_page: %d\n", ts, (void*)block.address, total_pages, idle_count);
                 }
                 fflush(fp);
                 fclose(fp);
             } else {
                 LOG("打开日志文件失败: %s, 路径: %s", strerror(errno), LOG_FILE_PATH);
             }
-            std::this_thread::sleep_for(std::chrono::seconds(2));
         }
         LOG("内核 Idle 独立监控线程已停止");
     }).detach();
 }
 
-static void WriteLog(int type, void* address, size_t size, const char* stack) {
+// 输出mem_reg.log
+static void WriteLog(AllocType type, void* address, size_t size, const char* stack) {
     uint64_t ts = GetTimeStamp();
     char log_buf[LOG_BUF_SIZE] = {0};
-    snprintf(log_buf, sizeof(log_buf), "%" PRIu64 ",%d,%p,%zu, %s\n", ts, type, address, size, stack);
+    snprintf(log_buf, sizeof(log_buf), "%" PRIu64 ",%d,%p,%zu, %s\n", ts, static_cast<int>(type), address, size, stack);
 
-    FILE* fp = fopen(LOG_FILE_PATH, "a+");
+    FILE* fp = fopen(LOG_FILE_PATH.data(), "a+");
     if (fp != nullptr) {
         fwrite(log_buf, 1, strlen(log_buf), fp);
         fflush(fp);
@@ -168,7 +161,7 @@ struct BacktraceContext {
 };
 
 static _Unwind_Reason_Code UnwindCallBack(_Unwind_Context* ctx, void* arg) {
-    BacktraceContext* context = (BacktraceContext*)arg;
+    auto* context = static_cast<BacktraceContext*>(arg);
     uintptr_t ip = _Unwind_GetIP(ctx);
     if (ip == 0) return _URC_NO_REASON;
     if (context->count < context->max_count) {
@@ -201,7 +194,7 @@ static void GetBackTrace(char* buf, size_t buf_size) {
 // 识别逻辑访问
 struct BacktraceState { uintptr_t* current; uintptr_t* end; };
 static _Unwind_Reason_Code UnwindLogic(struct _Unwind_Context* context, void* arg) {
-    BacktraceState* state = static_cast<BacktraceState*>(arg);
+    auto* state = static_cast<BacktraceState*>(arg);
     uintptr_t pc = _Unwind_GetIP(context);
     if (pc) {
         if (state->current == state->end) return _URC_END_OF_STACK;
@@ -214,10 +207,11 @@ static LogicID IdentifyLogicFromStack(uintptr_t* frames, size_t count) {
     for (size_t i = 0; i < count; ++i) {
         Dl_info info;
         if (dladdr((void*)frames[i], &info) && info.dli_sname) {
-            if (strstr(info.dli_sname, "Logic1")) return LogicID::LOGIC_1;
-            if (strstr(info.dli_sname, "Logic2")) return LogicID::LOGIC_2;
-            if (strstr(info.dli_sname, "Logic3")) return LogicID::LOGIC_3;
-            if (strstr(info.dli_sname, "Logic4")) return LogicID::LOGIC_4;
+            std::string_view sname(info.dli_sname);
+            if (sname.find("Logic1") != std::string_view::npos) return LogicID::LOGIC_1;
+            if (sname.find("Logic2") != std::string_view::npos) return LogicID::LOGIC_2;
+            if (sname.find("Logic3") != std::string_view::npos) return LogicID::LOGIC_3;
+            if (sname.find("Logic4") != std::string_view::npos) return LogicID::LOGIC_4;
         }
     }
     return LogicID::LOGIC_UNKNOWN;
@@ -225,7 +219,7 @@ static LogicID IdentifyLogicFromStack(uintptr_t* frames, size_t count) {
 
 // SIGSEGV 信号拦截器
 static void SigsegvHandler(int sig, siginfo_t *info, void *ucontext) {
-    uintptr_t fault_addr = (uintptr_t)info->si_addr;
+    auto fault_addr = reinterpret_cast<uintptr_t>(info->si_addr);
     uintptr_t page_base = fault_addr & ~(g_page_size - 1); // 找到所属的内存页起址
     
     MonitorBlock block;
@@ -246,12 +240,12 @@ static void SigsegvHandler(int sig, siginfo_t *info, void *ucontext) {
             MonitorManager::GetInstance().UpdateLogicAccess(page_base, logic);
         }
         
-        mprotect((void*)page_base, block.size, PROT_READ | PROT_WRITE);
+        mprotect(reinterpret_cast<void*>(page_base), block.size, PROT_READ | PROT_WRITE);
         return;
     }
     // 非隔离页，交给系统处理
-    if (old_sa.sa_flags & SA_SIGINFO) old_sa.sa_sigaction(sig, info, ucontext);
-    else if (old_sa.sa_handler != SIG_DFL && old_sa.sa_handler != SIG_IGN) old_sa.sa_handler(sig);
+    if (g_old_sa.sa_flags & SA_SIGINFO) g_old_sa.sa_sigaction(sig, info, ucontext);
+    else if (g_old_sa.sa_handler != SIG_DFL && g_old_sa.sa_handler != SIG_IGN) g_old_sa.sa_handler(sig);
 }
 
 // malloc 代理函数
@@ -283,14 +277,14 @@ static void* MyMalloc(size_t size) {
                 result = page_ptr;
                 LOG("成功接管自定义对象，真实大小: %zu，分配至隔离页: %p", size, result);
                 char backtrace[1024]; GetBackTrace(backtrace, sizeof(backtrace));
-                WriteLog(TYPE_MALLOC, result, size, backtrace);
+                WriteLog(AllocType::MALLOC, result, size, backtrace);
             }
         }
 
     }
     
     if (!need_hook) {
-        result = g_orig_malloc(size);
+        result = g_orig.malloc(size);
         // char backtrace[1024]; GetBackTrace(backtrace, sizeof(backtrace));
         // WriteLog(TYPE_MALLOC, result, size, backtrace);
     }
@@ -309,17 +303,20 @@ static void MyFree(void* ptr) {
         // 解锁释放内存
         mprotect(ptr, block.size, PROT_READ | PROT_WRITE);
         munmap(ptr, block.size);
-        WriteLog(TYPE_FREE, ptr, 0, nullptr);
+        WriteLog(AllocType::FREE, ptr, 0, nullptr);
         LOG("释放自定义受控隔离页: %p", ptr);
     } else {
-        g_orig_free(ptr);
-        WriteLog(TYPE_FREE, ptr, 0, nullptr);
+        g_orig.free(ptr);
+        WriteLog(AllocType::FREE, ptr, 0, nullptr);
     }
 }
 
 static void* MyRealloc(void* ptr, size_t size) {
     if (!ptr) return MyMalloc(size); 
-    if (size == 0) { MyFree(ptr); return nullptr; } 
+    if (size == 0) {
+        MyFree(ptr);
+        return nullptr;
+    }
 
     MonitorBlock old_block;
     if (MonitorManager::GetInstance().GetMonitorBlock((uintptr_t)ptr, old_block)) {
@@ -327,7 +324,7 @@ static void* MyRealloc(void* ptr, size_t size) {
         mprotect(ptr, old_block.size, PROT_READ | PROT_WRITE);
         void* new_ptr = MyMalloc(size);
         char backtrace[1024]; GetBackTrace(backtrace, sizeof(backtrace));
-        WriteLog(TYPE_REALLOC, new_ptr, size, backtrace);
+        WriteLog(AllocType::REALLOC, new_ptr, size, backtrace);
         if (new_ptr) {
             // 搬运数据
             MonitorBlock new_block;
@@ -348,80 +345,89 @@ static void* MyRealloc(void* ptr, size_t size) {
         return new_ptr;
     }
     
-    void* address = g_orig_realloc(ptr, size);
+    void* address = g_orig.realloc(ptr, size);
     char backtrace[1024]; GetBackTrace(backtrace, sizeof(backtrace));
-    WriteLog(TYPE_REALLOC, address, size, backtrace);
+    WriteLog(AllocType::REALLOC, address, size, backtrace);
     return address;
 }
 
 static void* MyCalloc(size_t size, size_t per_size) {
     uint64_t ts = GetTimeStamp();
-    void *address = g_orig_calloc(size, per_size);
+    void *address = g_orig.calloc(size, per_size);
     char backtrace[1024];
     GetBackTrace(backtrace, sizeof(backtrace));
     size_t total = size * per_size;
-    WriteLog(TYPE_CALLOC, address, total, backtrace);
+    WriteLog(AllocType::CALLOC, address, total, backtrace);
     return address;
 }
 
 static void* MyMmap(void* address, size_t length, int prot, int flags, int fd, off_t offset) {
     uint64_t ts = GetTimeStamp();
-    void* address_res = g_orig_mmap(address, length, prot, flags, fd, offset);
+    void* address_res = g_orig.mmap(address, length, prot, flags, fd, offset);
     char backtrace[1024];
     GetBackTrace(backtrace, sizeof(backtrace));
-    WriteLog(TYPE_MMAP, address_res, length, backtrace);
+    WriteLog(AllocType::MMAP, address_res, length, backtrace);
     return address_res;
 }
 
 static int MyMunmap(void* address, size_t length) {
     uint64_t ts = GetTimeStamp();
-    int res = g_orig_munmap(address, length);
-    WriteLog(TYPE_MUNMAP, address, 0, nullptr);
+    int res = g_orig.munmap(address, length);
+    WriteLog(AllocType::MUNMAP, address, 0, nullptr);
     return res;
 }
 
 // 钩子注册与生命周期管理
 static void OnHooked(bytehook_stub_t stub, int status, const char* caller, const char* sym, void* new_func, void* orig_func, void* arg) {
     if (status == BYTEHOOK_STATUS_CODE_ORIG_ADDR) {
-        if (strcmp(sym, "malloc") == 0) g_orig_malloc = (orig_malloc_t)orig_func;
-        else if (strcmp(sym, "realloc") == 0) g_orig_realloc = (orig_realloc_t)orig_func;
-        else if (strcmp(sym, "calloc") == 0) g_orig_calloc = (orig_calloc_t)orig_func;
-        else if (strcmp(sym, "free") == 0) g_orig_free = (orig_free_t)orig_func;
-        else if (strcmp(sym, "mmap") == 0) g_orig_mmap = (orig_mmap_t)orig_func;
-        else if (strcmp(sym, "munmap") == 0) g_orig_munmap = (orig_munmap_t)orig_func;
+        std::string_view symbol(sym);
+        if (symbol == "malloc") g_orig.malloc = reinterpret_cast<OrigMalloc>(orig_func);
+        else if (symbol == "realloc") g_orig.realloc = reinterpret_cast<OrigRealloc>(orig_func);
+        else if (symbol == "calloc") g_orig.calloc = reinterpret_cast<OrigCalloc>(orig_func);
+        else if (symbol == "free") g_orig.free = reinterpret_cast<OrigFree>(orig_func);
+        else if (symbol == "mmap") g_orig.mmap = reinterpret_cast<OrigMmap>(orig_func);
+        else if (symbol == "munmap") g_orig.munmap = reinterpret_cast<OrigMunmap>(orig_func);
         LOG("获取原函数地址成功: %s", sym);
     }
 }
 
 // 后台持续刷新页面权限
 static void StartMonitor() {
+    bool expected = false;
+    // 保证线程只启动一次
+    if (!g_kernel_monitor.compare_exchange_strong(expected, true)) return;
+
     std::thread([]() {
-        while (true) {
+        LOG("页面刷新线程已启动");
+        while (g_kernel_monitor) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100)); // 每 100ms 采样一次
             MonitorManager::GetInstance().ReprotectAllBlocks();
         }
+        LOG("页面刷新线程已停止");
     }).detach();
 }
 
 extern "C" int StartHook() {
-    struct sigaction sa;
+    struct sigaction sa{};
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = SigsegvHandler;
     sa.sa_flags = SA_SIGINFO | SA_NODEFER;
-    sigaction(SIGSEGV, &sa, &old_sa);
+    sigaction(SIGSEGV, &sa, &g_old_sa);
     StartMonitor();
     StartIdleMonitor();
 
     ElfReader::Analyze("libsample.so");
-
     bytehook_init(BYTEHOOK_MODE_MANUAL, true);
 
-    const char* symbols[] = {"malloc", "realloc", "calloc", "free", "mmap", "munmap"};
-    void* new_func[] = {(void*)MyMalloc, (void*)MyRealloc, (void*)MyCalloc,
-                        (void*)MyFree, (void*)MyMmap, (void*)MyMunmap};
+    const std::array<const char*, 6> symbols = {"malloc", "realloc", "calloc", "free", "mmap", "munmap"};
+    const std::array<void*, 6> functions = {
+            reinterpret_cast<void*>(MyMalloc), reinterpret_cast<void*>(MyRealloc),
+            reinterpret_cast<void*>(MyCalloc), reinterpret_cast<void*>(MyFree),
+            reinterpret_cast<void*>(MyMmap),   reinterpret_cast<void*>(MyMunmap)
+    };
 
     for (int i = 0; i < 6; i++) {
-        bytehook_stub_t stub = bytehook_hook_single("libsample.so", "libc.so", symbols[i], new_func[i], OnHooked, nullptr);
+        bytehook_stub_t stub = bytehook_hook_single("libsample.so", "libc.so", symbols[i], functions[i], OnHooked, nullptr);
         if (stub && g_hook_count < MAX_HOOK_COUNT) {
             g_hook_stubs[g_hook_count++] = stub;
         }
@@ -430,7 +436,7 @@ extern "C" int StartHook() {
 }
 
 extern "C" int StopHook() {
-    g_kernel_monitor_running = false;
+    g_kernel_monitor = false;
     for (int i = 0; i < g_hook_count; i++) {
         if (g_hook_stubs[i]) {
             bytehook_unhook(g_hook_stubs[i]);
@@ -438,8 +444,7 @@ extern "C" int StopHook() {
         }
     }
     g_hook_count = 0;
-    g_orig_malloc = nullptr; g_orig_realloc = nullptr; g_orig_calloc = nullptr;
-    g_orig_free = nullptr; g_orig_mmap = nullptr; g_orig_munmap = nullptr;
+    g_orig = OrigFunction{};
     LOG("Hook 卸载完成！");
     return 0;
 }
