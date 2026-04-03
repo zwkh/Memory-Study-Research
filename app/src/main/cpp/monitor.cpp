@@ -88,6 +88,16 @@ std::vector<StructMeta> PendingMonitor::GetStructMetas() {
     return struct_meta_;
 }
 
+std::vector<MonitorBlock> MonitorManager::GetAllBlocks() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<MonitorBlock> blocks;
+    blocks.reserve(monitor_map_.size());
+    for (auto const& [addr, block] : monitor_map_) {
+        blocks.push_back(block);
+    }
+    return blocks;
+}
+
 extern "C" __attribute__((visibility("default")))
 void RegisterMonitorStruct(const StructMeta* meta) {
     if (meta) {

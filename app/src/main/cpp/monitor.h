@@ -71,6 +71,7 @@ public:
     void UpdateMemberHot(uintptr_t addr, uint32_t offset);
     void UpdateLogicAccess(uintptr_t addr, LogicID logic_id);
     void ReprotectAllBlocks();
+    std::vector<MonitorBlock> GetAllBlocks();
 
 private:
     MonitorManager() = default;

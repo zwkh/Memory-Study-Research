@@ -75,7 +75,9 @@ extern "C" void TestStructVisit() {
         dlclose(handle);
     }
     TestStruct* shared_obj = (TestStruct*) malloc(sizeof(TestStruct));
-
+    for (int i=0;i<4;++i){
+        TestStruct* shared_obj = (TestStruct*) malloc(sizeof(TestStruct));
+    }
     // 启动 4 个线程，访问结构成员
     std::thread t1(Logic1, shared_obj);
     std::thread t2(Logic2, shared_obj);

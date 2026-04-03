@@ -10,6 +10,8 @@
 #include <sys/mman.h>
 #include <dlfcn.h>
 #include <csignal>
+#include <asm-generic/fcntl.h>
+#include <fcntl.h>
 
 #include "bytehook.h"
 #include "monitor.h"
@@ -53,12 +55,95 @@ static struct sigaction old_sa;
 
 // log保存路径
 #define LOG_FILE_PATH "/storage/emulated/0/Android/data/com.example.application/files/mem_reg.log"
+#define LOG_FILE_PATH_VIS "/storage/emulated/0/Android/data/com.example.application/files/mem_visit.log"
 #define LOG_BUF_SIZE 4096
+#define KERNEL_IDLE_BITMAP "/sys/kernel/mm/page_idle/bitmap"
+#define PAGEMAP_PATH "/proc/self/pagemap"
+
+static bool g_kernel_monitor_running = false;
+
+// 虚拟地址 -> 物理页帧号
+static uint64_t GetPFN(uintptr_t va) {
+    int fd = open(PAGEMAP_PATH, O_RDONLY);
+    if (fd < 0) return 0;
+    uint64_t entry;
+    // 每个 entry 8 字节
+    if (pread(fd, &entry, 8, (va / g_page_size) * 8) != 8) {
+        close(fd); return 0;
+    }
+    close(fd);
+    if (!(entry & (1ULL << 63))) return 0;
+    return entry & ((1ULL << 55) - 1);
+}
+
+static bool IsPageIdle(uint64_t pfn) {
+    int fd = open(KERNEL_IDLE_BITMAP, O_RDWR);
+    if (fd < 0) return false;
+    uint64_t byte_offset = (pfn / 64) * 8;
+    int bit_pos = pfn % 64;
+    uint64_t bitmap_val;
+    pread(fd, &bitmap_val, 8, byte_offset);
+    bool idle = (bitmap_val >> bit_pos) & 1ULL;
+
+    // 重置
+    uint64_t set_val = 1ULL << bit_pos;
+    pwrite(fd, &set_val, 8, byte_offset);
+    close(fd);
+    return idle;
+}
 
 static uint64_t GetTimeStamp() {
     timeval tv{};
     gettimeofday(&tv, nullptr);
     return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+static void StartIdleMonitor() {
+    if (g_kernel_monitor_running) return;
+    g_kernel_monitor_running = true;
+
+    std::thread([]() {
+        LOG("内核 Idle 独立监控线程已启动");
+        LOG("jjjjjjj %d", g_kernel_monitor_running);
+        while (g_kernel_monitor_running) {
+            // 每 2 秒进行一次物理内存采样
+            // std::this_thread::sleep_for(std::chrono::seconds(2));
+
+            std::vector<MonitorBlock> all_blocks = MonitorManager::GetInstance().GetAllBlocks();
+            if (all_blocks.empty()) continue;
+
+            LOG("kkkkkkkk %d", all_blocks.size());
+            uint64_t ts = GetTimeStamp();
+            // 以 a+ 模式打开，输出到同一个文件
+            FILE* fp = fopen(LOG_FILE_PATH_VIS, "a+");
+            LOG("hhhhhhhhhh %p", fp);
+            if (fp) {
+                LOG("成功打开文件");
+                for (auto& block : all_blocks) {
+                    int idle_count = 0;
+                    int total_pages = block.size / g_page_size;
+
+                    // 遍历该块内的每一个物理页
+                    for (uintptr_t curr = block.address; curr < block.address + block.size; curr += g_page_size) {
+                        uint64_t pfn = GetPFN(curr);
+                        if (pfn > 0 && IsPageIdle(pfn)) {
+                            idle_count++;
+                        }
+                    }
+
+                    // 日志输出格式：时间戳, 类型99, 地址, 总页数, 空闲页数
+                    // 这里的空闲页数越多，说明这块分配出的内存越“冷”
+                    fprintf(fp, "%" PRIu64 ",%p, total_page: %d, free_page: %d\n", ts, (void*)block.address, total_pages, idle_count);
+                }
+                fflush(fp);
+                fclose(fp);
+            } else {
+                LOG("打开日志文件失败: %s, 路径: %s", strerror(errno), LOG_FILE_PATH);
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+        LOG("内核 Idle 独立监控线程已停止");
+    }).detach();
 }
 
 static void WriteLog(int type, void* address, size_t size, const char* stack) {
@@ -325,6 +410,7 @@ extern "C" int StartHook() {
     sa.sa_flags = SA_SIGINFO | SA_NODEFER;
     sigaction(SIGSEGV, &sa, &old_sa);
     StartMonitor();
+    StartIdleMonitor();
 
     ElfReader::Analyze("libsample.so");
 
@@ -344,6 +430,7 @@ extern "C" int StartHook() {
 }
 
 extern "C" int StopHook() {
+    g_kernel_monitor_running = false;
     for (int i = 0; i < g_hook_count; i++) {
         if (g_hook_stubs[i]) {
             bytehook_unhook(g_hook_stubs[i]);

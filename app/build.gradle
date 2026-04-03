@@ -24,7 +24,7 @@ android {
             }
         }
         ndk {
-            abiFilters 'armeabi-v7a', 'arm64-v8a'
+            abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86_64'
         }
     }
 
@@ -50,9 +50,6 @@ android {
     }
     packaging {
         jniLibs {
-            // 这是核心配置：强制将 so 文件以压缩形式打包，
-            // 这样 Android 系统在安装 APK 时就不得不把它解压出来，
-            // 从而产生一个没有 "!" 的物理路径。
             useLegacyPackaging = true
         }
     }
@@ -65,5 +62,5 @@ dependencies {
     testImplementation libs.junit
     androidTestImplementation libs.ext.junit
     androidTestImplementation libs.espresso.core
-    implementation 'com.bytedance:bytehook:1.1.1'
+    implementation 'com.bytedance:bytehook:1.0.10'
 }
