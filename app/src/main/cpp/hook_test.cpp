@@ -57,6 +57,7 @@ static OrigFunction g_orig;
 static std::array<bytehook_stub_t, MAX_HOOK_COUNT> g_hook_stubs{};
 static std::atomic<int> g_hook_count{0};
 static std::atomic<bool> g_kernel_monitor{false};
+static std::atomic<bool> g_kernel_refresh{false};
 
 static const size_t g_page_size = sysconf(_SC_PAGESIZE);
 static struct sigaction g_old_sa;
@@ -72,6 +73,7 @@ static uint64_t GetPFN(uintptr_t va) {
     }
     close(fd);
     // 物理页未加载到内存
+    LOG("entry----------- %lu", entry);
     if (!(entry & (1ULL << 63))) return 0;
     // 找到PFN
     return entry & ((1ULL << 55) - 1);
@@ -79,6 +81,7 @@ static uint64_t GetPFN(uintptr_t va) {
 
 static bool IsPageIdle(uint64_t pfn) {
     int fd = open(KERNEL_IDLE_BITMAP.data(), O_RDWR);
+    LOG("fd------------- %d", fd);
     if (fd < 0) return false;
     uint64_t byte_offset = (pfn / 64) * 8;
     int bit_pos = pfn % 64;
@@ -86,6 +89,7 @@ static bool IsPageIdle(uint64_t pfn) {
     pread(fd, &bitmap_val, 8, byte_offset);
     // 判断该页访问没有
     bool idle = (bitmap_val >> bit_pos) & 1ULL;
+    LOG("idle------- %d", idle);
     // 重置
     uint64_t set_val = 1ULL << bit_pos;
     pwrite(fd, &set_val, 8, byte_offset);
@@ -115,18 +119,20 @@ static void StartIdleMonitor() {
             FILE* fp = fopen(LOG_FILE_PATH_VIS.data(), "a+");
             if (fp) {
                 for (auto& block : all_blocks) {
-                    int idle_count = 0;
-                    int total_pages = block.size / g_page_size;
+                    int hot_count = 0;
+                    bool has_alloc = false;
+                    int total_count = block.size / g_page_size;
 
                     // 遍历该块内的每一个物理页
                     for (uintptr_t curr = block.address; curr < block.address + block.size; curr += g_page_size) {
                         uint64_t pfn = GetPFN(curr);
-                        if (pfn > 0 && IsPageIdle(pfn)) {
-                            idle_count++;
+                        if (pfn > 0 && !IsPageIdle(pfn)){
+                            hot_count++;
+                            has_alloc = true;
                         }
                     }
                     // 输出mem_visit.log
-                    fprintf(fp, "%" PRIu64 ",%p, total_page: %d, hot_page: %d\n", ts, (void*)block.address, total_pages, idle_count);
+                    fprintf(fp, "%" PRIu64 ",%p, has_alloc: %d, total_page: %d, hot_page: %d\n", ts, (void*)block.address, has_alloc, total_count, hot_count);
                 }
                 fflush(fp);
                 fclose(fp);
@@ -307,7 +313,7 @@ static void MyFree(void* ptr) {
         LOG("释放自定义受控隔离页: %p", ptr);
     } else {
         g_orig.free(ptr);
-        WriteLog(AllocType::FREE, ptr, 0, nullptr);
+        // WriteLog(AllocType::FREE, ptr, 0, nullptr);
     }
 }
 
@@ -395,11 +401,11 @@ static void OnHooked(bytehook_stub_t stub, int status, const char* caller, const
 static void StartMonitor() {
     bool expected = false;
     // 保证线程只启动一次
-    if (!g_kernel_monitor.compare_exchange_strong(expected, true)) return;
+    if (!g_kernel_refresh.compare_exchange_strong(expected, true)) return;
 
     std::thread([]() {
         LOG("页面刷新线程已启动");
-        while (g_kernel_monitor) {
+        while (g_kernel_refresh) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100)); // 每 100ms 采样一次
             MonitorManager::GetInstance().ReprotectAllBlocks();
         }
