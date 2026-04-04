@@ -443,6 +443,7 @@ extern "C" int StartHook() {
 
 extern "C" int StopHook() {
     g_kernel_monitor = false;
+    g_kernel_refresh = false;
     for (int i = 0; i < g_hook_count; i++) {
         if (g_hook_stubs[i]) {
             bytehook_unhook(g_hook_stubs[i]);
